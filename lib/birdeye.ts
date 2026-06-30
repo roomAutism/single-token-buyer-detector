@@ -1,4 +1,5 @@
 import { MAX_TOKEN_TRADE_PAGES, SOL_MINT } from "./constants";
+import { ApiError, safeSnippet } from "./errors";
 import { withRetry } from "./rate-limit";
 import type { BuyerLimit, TokenBuyer } from "./types";
 
@@ -83,9 +84,27 @@ function extractItems(payload: unknown): UnknownRecord[] {
   return Array.isArray(raw) ? raw.map(asRecord) : [];
 }
 
+function parseJsonText(raw: string) {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new ApiError("Birdeye response is non-JSON", {
+      source: "birdeye",
+      status: 502,
+      details: safeSnippet(raw)
+    });
+  }
+}
+
 export async function fetchTokenBuyers(tokenMint: string, limit: BuyerLimit): Promise<TokenBuyer[]> {
   const apiKey = process.env.BIRDEYE_API_KEY;
-  if (!apiKey) throw new Error("Missing BIRDEYE_API_KEY");
+  if (!apiKey) {
+    throw new ApiError("Missing environment variable", {
+      source: "server",
+      status: 500,
+      details: "Missing BIRDEYE_API_KEY"
+    });
+  }
 
   const buyers = new Map<string, TokenBuyer>();
   const pageSize = 50;
@@ -99,6 +118,7 @@ export async function fetchTokenBuyers(tokenMint: string, limit: BuyerLimit): Pr
     url.searchParams.set("sort_by", "block_unix_time");
     url.searchParams.set("sort_type", "asc");
 
+    const startedAt = Date.now();
     const payload = await withRetry(async () => {
       const response = await fetch(url, {
         headers: {
@@ -108,8 +128,36 @@ export async function fetchTokenBuyers(tokenMint: string, limit: BuyerLimit): Pr
         },
         cache: "no-store"
       });
-      if (!response.ok) throw new Error(`Birdeye request failed: ${response.status}`);
-      return response.json();
+      const raw = await response.text();
+      const durationMs = Date.now() - startedAt;
+
+      if (!response.ok) {
+        console.error("[upstream-response]", {
+          source: "birdeye",
+          status: response.status,
+          snippet: safeSnippet(raw),
+          durationMs,
+          retries: 0
+        });
+        throw new ApiError(`Birdeye upstream ${response.status}`, {
+          source: "birdeye",
+          status: response.status,
+          details: safeSnippet(raw) || `HTTP ${response.status}`
+        });
+      }
+
+      try {
+        return parseJsonText(raw);
+      } catch (error) {
+        console.error("[upstream-response]", {
+          source: "birdeye",
+          status: response.status,
+          snippet: safeSnippet(raw),
+          durationMs,
+          retries: 0
+        });
+        throw error;
+      }
     });
 
     const items = extractItems(payload);

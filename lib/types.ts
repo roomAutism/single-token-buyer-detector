@@ -1,6 +1,12 @@
-export type BuyerLimit = 100 | 300 | 500;
-export type HistoryRange = "20swaps" | "30d" | "90d" | "500swaps" | "full";
-export type AnalysisStatus = "completed" | "data_insufficient" | "analysis_error" | "coverage_limited";
+export type BuyerLimit = 10 | 100 | 300 | 500;
+export type HistoryRange = "recent20" | "recent100" | "full";
+export type AnalysisStatus =
+  | "pending"
+  | "analyzing"
+  | "completed"
+  | "data_insufficient"
+  | "analysis_error"
+  | "coverage_limited";
 
 export type TokenBuyer = {
   wallet: string;
@@ -71,3 +77,31 @@ export type AnalyzeResponse = {
   wallets: WalletAnalysis[];
   debugWallet?: DebugWalletResult;
 };
+
+export type AnalyzeWalletRequest = {
+  tokenCa: string;
+  wallet: string;
+  historyMode: HistoryRange;
+  maxPages?: number;
+  maxTransactions?: number;
+  buyer?: TokenBuyer;
+};
+
+export type AnalyzeWalletResponse =
+  | {
+      ok: true;
+      wallet: WalletAnalysis;
+    }
+  | {
+      ok: false;
+      error: string;
+      source: "server" | "birdeye" | "helius";
+      status: number;
+      reason: string;
+      wallet: string;
+      partial?: {
+        pagesScanned: number;
+        transactionsScanned: number;
+      };
+      details?: string;
+    };

@@ -182,6 +182,12 @@ select:focus {
   padding: 14px;
 }
 
+.hintPanel {
+  margin-top: 14px;
+  padding: 12px 14px;
+  color: var(--muted);
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(130px, 1fr));
@@ -390,6 +396,16 @@ a {
 .coverage_limited {
   background: #eef4ff;
   color: #175cd3;
+}
+
+.pending {
+  background: #f2f4f7;
+  color: var(--muted);
+}
+
+.analyzing {
+  background: #e7f7ee;
+  color: var(--accent-dark);
 }
 
 .emptyCell {

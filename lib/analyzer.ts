@@ -1,22 +1,14 @@
 import { readWalletCache, writeWalletCache } from "./cache";
 import { fetchTokenBuyers } from "./birdeye";
-import { runWithConcurrency } from "./rate-limit";
-import { scanWalletSwapHistory, walletStillHoldsMint } from "./helius";
-import type {
-  AnalyzeResponse,
-  BuyerLimit,
-  DebugWalletResult,
-  HistoryRange,
-  TokenBuyer,
-  WalletAnalysis
-} from "./types";
+import { scanWalletSwapHistory, walletStillHoldsMint, type ScanWalletOptions } from "./helius";
+import type { AnalyzeResponse, BuyerLimit, HistoryRange, TokenBuyer, WalletAnalysis } from "./types";
 
 function walletAgeDays(firstActivityAt?: string) {
   if (!firstActivityAt) return undefined;
   return Math.max(0, Math.floor((Date.now() - new Date(firstActivityAt).getTime()) / (24 * 60 * 60 * 1000)));
 }
 
-function emptyBuyer(wallet: string): TokenBuyer {
+export function emptyBuyer(wallet: string): TokenBuyer {
   return {
     wallet,
     firstBuyAmountSol: 0,
@@ -24,17 +16,39 @@ function emptyBuyer(wallet: string): TokenBuyer {
   };
 }
 
+function pendingWallet(buyer: TokenBuyer): WalletAnalysis {
+  return {
+    ...buyer,
+    analysisStatus: "pending",
+    status: "pending",
+    strictSingleToken: false,
+    tradedCurrentToken: false,
+    distinctBoughtMints: [],
+    distinctBoughtMintCount: 0,
+    nonBaseTokenMints: [],
+    uniqueNonBaseTokenCount: 0,
+    stillHolding: null,
+    currentlyHolding: null,
+    soldOut: null,
+    scanTransactionCount: 0,
+    scanPageCount: 0,
+    heliusStatusCodes: [],
+    heliusRetryCount: 0,
+    debugEvents: []
+  };
+}
+
 export async function analyzeWallet(
   tokenMint: string,
   historyRange: HistoryRange,
   buyer: TokenBuyer,
-  options: { useCache?: boolean } = {}
+  options: ScanWalletOptions & { useCache?: boolean } = {}
 ): Promise<WalletAnalysis> {
-  const useCache = options.useCache ?? true;
+  const useCache = options.useCache ?? historyRange !== "full";
   const cached = useCache ? readWalletCache(buyer.wallet, tokenMint, historyRange) : null;
   if (cached) return cached;
 
-  const scan = await scanWalletSwapHistory(buyer.wallet, tokenMint, historyRange);
+  const scan = await scanWalletSwapHistory(buyer.wallet, tokenMint, historyRange, options);
   const nonBaseTokenMints = [...scan.nonBaseTokenMints].sort();
   const strictSingleToken =
     scan.status === "completed" && nonBaseTokenMints.length === 1 && nonBaseTokenMints[0] === tokenMint;
@@ -71,7 +85,7 @@ export async function analyzeWallet(
   return result;
 }
 
-function summarize(wallets: WalletAnalysis[]) {
+export function summarize(wallets: WalletAnalysis[]) {
   const strictSingleTokenWallets = wallets.filter((wallet) => wallet.strictSingleToken).length;
   const multiTokenWallets = wallets.filter(
     (wallet) => wallet.analysisStatus === "completed" && !wallet.strictSingleToken
@@ -93,38 +107,13 @@ function summarize(wallets: WalletAnalysis[]) {
   };
 }
 
-function findBuyer(buyers: TokenBuyer[], wallet: string) {
-  const index = buyers.findIndex((buyer) => buyer.wallet === wallet);
-  if (index === -1) return undefined;
-  return { buyer: buyers[index], rank: index + 1 };
-}
-
-export async function analyzeTokenBuyers(
+export async function fetchBuyerList(
   tokenMint: string,
   buyerLimit: BuyerLimit,
-  historyRange: HistoryRange,
-  debugWalletAddress?: string
+  historyRange: HistoryRange
 ): Promise<AnalyzeResponse> {
   const buyers = await fetchTokenBuyers(tokenMint, buyerLimit);
-  const wallets = await runWithConcurrency(buyers, 3, (buyer) => analyzeWallet(tokenMint, historyRange, buyer));
-
-  let debugWallet: DebugWalletResult | undefined;
-  if (debugWalletAddress) {
-    const match = findBuyer(buyers, debugWalletAddress);
-    const debugAnalysis = await analyzeWallet(
-      tokenMint,
-      historyRange,
-      match?.buyer ?? emptyBuyer(debugWalletAddress),
-      { useCache: false }
-    );
-
-    debugWallet = {
-      wallet: debugAnalysis,
-      isInBuyerList: !!match,
-      buyerRank: match?.rank,
-      buyer: match?.buyer
-    };
-  }
+  const wallets = buyers.map(pendingWallet);
 
   return {
     tokenMint,
@@ -132,7 +121,6 @@ export async function analyzeTokenBuyers(
     historyRange,
     generatedAt: new Date().toISOString(),
     summary: summarize(wallets),
-    wallets,
-    debugWallet
+    wallets
   };
 }
