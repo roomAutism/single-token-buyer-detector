@@ -1,0 +1,66 @@
+# Single-Token Buyer Detector
+
+Solana 链上分析 MVP：输入一个 Token CA，读取该 token 的买入钱包，再扫描钱包历史 DEX swap，只保留历史上主动买入过且唯一买入 mint 等于当前 CA 的钱包。
+
+## 当前 MVP
+
+- Next.js + TypeScript
+- 服务端 API route 调用 Birdeye 和 Helius
+- 前端不接触 API key
+- 默认扫描前 100 名买家，也支持 300 / 500
+- 支持 30 天、90 天、最近 500 笔 swap、全历史
+- 服务端缓存钱包分析结果 24 小时
+- 并发限制、重试、CSV 导出
+
+## 数据规则
+
+本工具不使用当前余额判断钱包是否“只买过一个币”。判断基于历史 SWAP：
+
+- 只统计钱包主动 swap 买入后收到的 token mint
+- SOL / wSOL / USDC / USDT 不计入买过的币种
+- 普通转账、空投、创建 ATA 余额变化不计入
+- API 失败、分页未完成、达到全历史页数保护上限时，钱包标记为“数据不足”，不会被算作严格单币钱包
+
+## 配置
+
+复制环境变量文件：
+
+```bash
+cp .env.example .env.local
+```
+
+填入：
+
+```bash
+BIRDEYE_API_KEY=your_birdeye_key
+HELIUS_API_KEY=your_helius_key
+```
+
+## 本地运行
+
+```bash
+pnpm install
+pnpm dev
+```
+
+打开 `http://localhost:3000`。
+
+## 部署到 Vercel
+
+1. 将项目推到 GitHub。
+2. 在 Vercel Dashboard 点击 Add New → Project。
+3. 选择这个 GitHub 仓库并导入。
+4. Framework Preset 选择 Next.js，其他保持默认：
+   - Install Command: `pnpm install`
+   - Build Command: `pnpm build`
+   - Output Directory: 留空
+5. 在 Environment Variables 添加：
+   - `BIRDEYE_API_KEY`
+   - `HELIUS_API_KEY`
+6. 点击 Deploy。
+
+注意：当前 MVP 使用服务端内存缓存，适合先部署验证。Vercel Serverless 多实例或冷启动后缓存可能丢失；生产版建议把 `lib/cache.ts` 换成 Vercel KV、Upstash Redis 或 Postgres。
+
+## 安全
+
+本工具不连接钱包、不需要私钥、不签名、不执行交易，只读取公开链上数据。
