@@ -11,7 +11,17 @@ import type {
   WalletAnalysis
 } from "@/lib/types";
 
-type SortKey = "firstBuyAt" | "totalBuyAmountSol" | "walletAgeDays";
+type SortKey =
+  | "default"
+  | "firstBuyAt"
+  | "totalBuyAmountSol"
+  | "historicalSwappedNonBaseTokenCount"
+  | "everHeldNonBaseTokenCount"
+  | "currentHeldNonBaseTokenCount"
+  | "walletAgeDays"
+  | "analysisStatus"
+  | "strictSingleToken";
+type SortDirection = "asc" | "desc" | null;
 
 function fmtDate(value?: string) {
   if (!value) return "-";
@@ -35,6 +45,7 @@ function statusLabel(wallet: WalletAnalysis) {
   if (wallet.analysisStatus === "pending") return "等待中";
   if (wallet.analysisStatus === "analyzing") return "分析中";
   if (wallet.analysisStatus === "retrying") return "限流重试";
+  if (wallet.analysisStatus === "rate_limited") return "限流失败";
   if (wallet.analysisStatus === "completed") return wallet.strictSingleToken ? "严格单币" : "多币/非单币";
   if (wallet.analysisStatus === "data_insufficient") return "数据不足";
   if (wallet.analysisStatus === "analysis_error") return "分析失败";
@@ -49,26 +60,33 @@ function statusClass(wallet: WalletAnalysis) {
 function toCsv(rows: WalletAnalysis[]) {
   const header = [
     "wallet",
-    "analysisStatus",
-    "strictSingleToken",
-    "tradedCurrentToken",
-    "firstBuyAt",
-    "firstBuyAmountSol",
-    "totalBuyAmountSol",
+    "historicalSwappedNonBaseTokenCount",
+    "everHeldNonBaseTokenCount",
+    "currentHeldNonBaseTokenCount",
     "currentlyHolding",
     "soldOut",
-    "uniqueNonBaseTokenCount",
-    "nonBaseTokenMints",
+    "analysisStatus",
+    "failureReason",
+    "rateLimitRetryCount",
+    "firstBuyAt",
+    "totalBuySol",
+    "walletAgeDays",
+    "strictSingleToken",
+    "tradedCurrentToken",
+    "firstBuyAmountSol",
     "scanTransactionCount",
     "scanPageCount",
     "scanStartedAt",
-    "scanEndedAt",
-    "reason"
+    "scanEndedAt"
   ];
   const body = rows.map((row) =>
     header
       .map((key) => {
-        const value = row[key as keyof WalletAnalysis];
+        const value =
+          key === "failureReason" ? row.reason :
+          key === "rateLimitRetryCount" ? row.heliusRetryCount :
+          key === "totalBuySol" ? row.totalBuyAmountSol :
+          row[key as keyof WalletAnalysis];
         return `"${String(Array.isArray(value) ? value.join("|") : value ?? "").replaceAll('"', '""')}"`;
       })
       .join(",")
@@ -91,11 +109,22 @@ function summarizeRows(rows: WalletAnalysis[]) {
   };
 }
 
+const statusPriority: Record<string, number> = {
+  completed: 0,
+  retrying: 1,
+  rate_limited: 2,
+  coverage_limited: 3,
+  data_insufficient: 4,
+  analysis_error: 5,
+  pending: 6,
+  analyzing: 7
+};
+
 function failedWallet(base: WalletAnalysis, message: string): WalletAnalysis {
   return {
     ...base,
-    analysisStatus: "analysis_error",
-    status: "analysis_error",
+    analysisStatus: message === "Helius rate limited after 3 retries" ? "rate_limited" : "analysis_error",
+    status: message === "Helius rate limited after 3 retries" ? "rate_limited" : "analysis_error",
     reason: message
   };
 }
@@ -123,7 +152,9 @@ function WalletDetails({ wallet }: { wallet: WalletAnalysis }) {
       <div className="detailsGrid">
         <div><span>analysis_status</span><strong>{wallet.analysisStatus}</strong></div>
         <div><span>strict_single_token</span><strong>{String(wallet.strictSingleToken)}</strong></div>
-        <div><span>unique_non_base_token_count</span><strong>{wallet.uniqueNonBaseTokenCount}</strong></div>
+        <div><span>historical_swapped_count</span><strong>{wallet.historicalSwappedNonBaseTokenCount}</strong></div>
+        <div><span>ever_held_count</span><strong>{wallet.everHeldNonBaseTokenCount}</strong></div>
+        <div><span>current_held_count</span><strong>{wallet.currentHeldNonBaseTokenCount}</strong></div>
         <div><span>traded_current_token</span><strong>{String(wallet.tradedCurrentToken)}</strong></div>
         <div><span>currently_holding</span><strong>{yesNo(wallet.currentlyHolding)}</strong></div>
         <div><span>sold_out</span><strong>{yesNo(wallet.soldOut)}</strong></div>
@@ -135,8 +166,40 @@ function WalletDetails({ wallet }: { wallet: WalletAnalysis }) {
         <div><span>helius_retries</span><strong>{wallet.heliusRetryCount}</strong></div>
       </div>
       <div className="mintList">
-        <span>发现的非基础 Token mint</span>
-        {wallet.nonBaseTokenMints.length ? wallet.nonBaseTokenMints.map((mint) => <code key={mint}>{mint}</code>) : <em>未发现</em>}
+        <span>历史参与 Token 列表</span>
+        {wallet.historicalSwappedTokens.length ? wallet.historicalSwappedTokens.map((token) => (
+          <div className="tokenRow" key={token.mint}>
+            <code>{token.mint}</code>
+            <span>{token.isCurrentToken ? "当前 Token" : "其他 Token"}</span>
+            <span>首次 {fmtDate(token.firstSeenAt)}</span>
+            <span>最后 {fmtDate(token.lastSeenAt)}</span>
+            <span>买入 {token.buyCount}</span>
+            <span>卖出 {token.sellCount}</span>
+          </div>
+        )) : <em>未发现</em>}
+      </div>
+      <div className="mintList">
+        <span>累计曾持有 Token 列表</span>
+        {wallet.everHeldTokens.length ? wallet.everHeldTokens.map((token) => (
+          <div className="tokenRow" key={token.mint}>
+            <code>{token.mint}</code>
+            <span>首次持有 {fmtDate(token.firstHeldAt)}</span>
+            <span>当前余额 {yesNo(token.currentlyHeld)}</span>
+            <span>获得方式 {token.acquiredBy}</span>
+            <span>{token.excludedAsDustOrAirdrop ? "疑似空投/dust 排除" : "计入"}</span>
+          </div>
+        )) : <em>未发现</em>}
+      </div>
+      <div className="mintList">
+        <span>当前持有 Token 列表</span>
+        {wallet.currentHeldTokens.length ? wallet.currentHeldTokens.map((token) => (
+          <div className="tokenRow" key={token.mint}>
+            <code>{token.mint}</code>
+            <span>数量 {token.amount}</span>
+            <span>{token.isCurrentToken ? "当前 Token" : "其他 Token"}</span>
+            <span>{token.isBaseAsset ? "基础资产" : "非基础资产"}</span>
+          </div>
+        )) : <em>未发现</em>}
       </div>
       <div className="eventList">
         <span>判定过程</span>
@@ -166,7 +229,16 @@ export function AnalyzerClient() {
   const [historyRange, setHistoryRange] = useState<HistoryRange>("recent20");
   const [onlySingle, setOnlySingle] = useState(true);
   const [onlyHolding, setOnlyHolding] = useState(false);
-  const [sortKey, setSortKey] = useState<SortKey>("firstBuyAt");
+  const [sortKey, setSortKey] = useState<SortKey>("default");
+  const [sortDirection, setSortDirection] = useState<SortDirection>(null);
+  const [everHeldFilter, setEverHeldFilter] = useState("all");
+  const [currentHeldFilter, setCurrentHeldFilter] = useState("all");
+  const [walletAgeFilter, setWalletAgeFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [everHeldMin, setEverHeldMin] = useState("");
+  const [everHeldMax, setEverHeldMax] = useState("");
+  const [ageMin, setAgeMin] = useState("");
+  const [ageMax, setAgeMax] = useState("");
   const [expandedWallet, setExpandedWallet] = useState<string | null>(null);
   const [data, setData] = useState<AnalyzeResponse | null>(null);
   const [debugResult, setDebugResult] = useState<WalletAnalysis | null>(null);
@@ -358,6 +430,12 @@ export function AnalyzerClient() {
       distinctBoughtMintCount: 0,
       nonBaseTokenMints: [],
       uniqueNonBaseTokenCount: 0,
+      historicalSwappedNonBaseTokenCount: 0,
+      everHeldNonBaseTokenCount: 0,
+      currentHeldNonBaseTokenCount: 0,
+      historicalSwappedTokens: [],
+      everHeldTokens: [],
+      currentHeldTokens: [],
       stillHolding: null,
       currentlyHolding: null,
       soldOut: null,
@@ -430,17 +508,110 @@ export function AnalyzerClient() {
   }
 
   const summary = useMemo(() => summarizeRows(data?.wallets ?? []), [data]);
+  function inEverHeldRange(wallet: WalletAnalysis) {
+    const value = wallet.everHeldNonBaseTokenCount;
+    if (everHeldFilter === "one") return value === 1;
+    if (everHeldFilter === "1-3") return value >= 1 && value <= 3;
+    if (everHeldFilter === "4-10") return value >= 4 && value <= 10;
+    if (everHeldFilter === "gt10") return value > 10;
+    if (everHeldFilter === "custom") {
+      const min = everHeldMin === "" ? -Infinity : Number(everHeldMin);
+      const max = everHeldMax === "" ? Infinity : Number(everHeldMax);
+      return value >= min && value <= max;
+    }
+    return true;
+  }
+
+  function inCurrentHeldRange(wallet: WalletAnalysis) {
+    const value = wallet.currentHeldNonBaseTokenCount;
+    if (currentHeldFilter === "0") return value === 0;
+    if (currentHeldFilter === "1") return value === 1;
+    if (currentHeldFilter === "2-5") return value >= 2 && value <= 5;
+    if (currentHeldFilter === "gt5") return value > 5;
+    return true;
+  }
+
+  function inAgeRange(wallet: WalletAnalysis) {
+    const value = wallet.walletAgeDays;
+    if (value === undefined) return walletAgeFilter === "all";
+    if (walletAgeFilter === "lt1") return value < 1;
+    if (walletAgeFilter === "lt7") return value < 7;
+    if (walletAgeFilter === "lt30") return value < 30;
+    if (walletAgeFilter === "custom") {
+      const min = ageMin === "" ? -Infinity : Number(ageMin);
+      const max = ageMax === "" ? Infinity : Number(ageMax);
+      return value >= min && value <= max;
+    }
+    return true;
+  }
+
+  function defaultCompare(a: WalletAnalysis, b: WalletAnalysis) {
+    if (onlySingle) {
+      return (
+        Number(b.strictSingleToken) - Number(a.strictSingleToken) ||
+        a.everHeldNonBaseTokenCount - b.everHeldNonBaseTokenCount ||
+        new Date(a.firstBuyAt ?? 0).getTime() - new Date(b.firstBuyAt ?? 0).getTime()
+      );
+    }
+    return (
+      (statusPriority[a.analysisStatus] ?? 99) - (statusPriority[b.analysisStatus] ?? 99) ||
+      a.historicalSwappedNonBaseTokenCount - b.historicalSwappedNonBaseTokenCount ||
+      a.everHeldNonBaseTokenCount - b.everHeldNonBaseTokenCount ||
+      new Date(a.firstBuyAt ?? 0).getTime() - new Date(b.firstBuyAt ?? 0).getTime()
+    );
+  }
+
+  function sortCompare(a: WalletAnalysis, b: WalletAnalysis) {
+    if (sortKey === "default" || !sortDirection) return defaultCompare(a, b);
+    const direction = sortDirection === "asc" ? 1 : -1;
+    if (sortKey === "firstBuyAt") {
+      return direction * (new Date(a.firstBuyAt ?? 0).getTime() - new Date(b.firstBuyAt ?? 0).getTime());
+    }
+    if (sortKey === "totalBuyAmountSol") return direction * (a.totalBuyAmountSol - b.totalBuyAmountSol);
+    if (sortKey === "walletAgeDays") return direction * ((a.walletAgeDays ?? -1) - (b.walletAgeDays ?? -1));
+    if (sortKey === "analysisStatus") {
+      return direction * ((statusPriority[a.analysisStatus] ?? 99) - (statusPriority[b.analysisStatus] ?? 99));
+    }
+    if (sortKey === "strictSingleToken") {
+      return (
+        direction * (Number(a.strictSingleToken) - Number(b.strictSingleToken)) ||
+        a.everHeldNonBaseTokenCount - b.everHeldNonBaseTokenCount ||
+        new Date(a.firstBuyAt ?? 0).getTime() - new Date(b.firstBuyAt ?? 0).getTime()
+      );
+    }
+    return direction * (Number(a[sortKey]) - Number(b[sortKey]));
+  }
+
+  function cycleSort(key: SortKey, defaultDirection: Exclude<SortDirection, null> = "desc") {
+    if (sortKey !== key) {
+      setSortKey(key);
+      setSortDirection(defaultDirection);
+      return;
+    }
+    if (sortDirection === defaultDirection) {
+      setSortDirection(defaultDirection === "desc" ? "asc" : "desc");
+      return;
+    }
+    setSortKey("default");
+    setSortDirection(null);
+  }
+
+  function sortArrow(key: SortKey) {
+    if (sortKey !== key || !sortDirection) return "";
+    return sortDirection === "asc" ? " ↑" : " ↓";
+  }
+
   const rows = useMemo(() => {
     const source = data?.wallets ?? [];
     return source
       .filter((wallet) => (onlySingle ? wallet.analysisStatus === "completed" && wallet.strictSingleToken : true))
       .filter((wallet) => (onlyHolding ? wallet.currentlyHolding === true : true))
-      .sort((a, b) => {
-        if (sortKey === "totalBuyAmountSol") return b.totalBuyAmountSol - a.totalBuyAmountSol;
-        if (sortKey === "walletAgeDays") return (b.walletAgeDays ?? -1) - (a.walletAgeDays ?? -1);
-        return new Date(a.firstBuyAt ?? 0).getTime() - new Date(b.firstBuyAt ?? 0).getTime();
-      });
-  }, [data, onlyHolding, onlySingle, sortKey]);
+      .filter(inEverHeldRange)
+      .filter(inCurrentHeldRange)
+      .filter(inAgeRange)
+      .filter((wallet) => (statusFilter === "all" ? true : wallet.analysisStatus === statusFilter))
+      .sort(sortCompare);
+  }, [data, onlyHolding, onlySingle, sortKey, sortDirection, everHeldFilter, currentHeldFilter, walletAgeFilter, statusFilter, everHeldMin, everHeldMax, ageMin, ageMax]);
 
   function exportCsv() {
     const blob = new Blob([toCsv(rows)], { type: "text/csv;charset=utf-8" });
@@ -541,10 +712,66 @@ export function AnalyzerClient() {
             <button className="secondaryButton" onClick={retryAllRateLimitedWallets} disabled={!data.wallets.some((wallet) => isHelius429(wallet))}>
               重试所有限流失败钱包
             </button>
-            <select value={sortKey} onChange={(event) => setSortKey(event.target.value as SortKey)}>
-              <option value="firstBuyAt">按首次买入时间</option>
-              <option value="totalBuyAmountSol">按累计买入金额</option>
-              <option value="walletAgeDays">按钱包年龄</option>
+            <select value={`${sortKey}:${sortDirection ?? "default"}`} onChange={(event) => {
+              const [key, direction] = event.target.value.split(":") as [SortKey, string];
+              setSortKey(key);
+              setSortDirection(direction === "default" ? null : direction as SortDirection);
+            }}>
+              <option value="default:default">默认排序</option>
+              <option value="firstBuyAt:asc">首次买入最早优先</option>
+              <option value="firstBuyAt:desc">首次买入最近优先</option>
+              <option value="totalBuyAmountSol:desc">累计 SOL 高到低</option>
+              <option value="totalBuyAmountSol:asc">累计 SOL 低到高</option>
+              <option value="historicalSwappedNonBaseTokenCount:asc">历史参与少到多</option>
+              <option value="historicalSwappedNonBaseTokenCount:desc">历史参与多到少</option>
+              <option value="everHeldNonBaseTokenCount:asc">曾持有少到多</option>
+              <option value="everHeldNonBaseTokenCount:desc">曾持有多到少</option>
+              <option value="currentHeldNonBaseTokenCount:asc">当前持有少到多</option>
+              <option value="currentHeldNonBaseTokenCount:desc">当前持有多到少</option>
+              <option value="walletAgeDays:asc">新钱包优先</option>
+              <option value="walletAgeDays:desc">老钱包优先</option>
+              <option value="analysisStatus:asc">分析状态优先</option>
+              <option value="strictSingleToken:desc">严格单币优先</option>
+            </select>
+            <select value={everHeldFilter} onChange={(event) => setEverHeldFilter(event.target.value)}>
+              <option value="all">累计曾持有：全部</option>
+              <option value="one">仅 1 种</option>
+              <option value="1-3">1-3 种</option>
+              <option value="4-10">4-10 种</option>
+              <option value="gt10">大于 10 种</option>
+              <option value="custom">自定义</option>
+            </select>
+            {everHeldFilter === "custom" ? <>
+              <input className="smallInput" value={everHeldMin} onChange={(event) => setEverHeldMin(event.target.value)} placeholder="曾持有最小" />
+              <input className="smallInput" value={everHeldMax} onChange={(event) => setEverHeldMax(event.target.value)} placeholder="曾持有最大" />
+            </> : null}
+            <select value={currentHeldFilter} onChange={(event) => setCurrentHeldFilter(event.target.value)}>
+              <option value="all">当前持有：全部</option>
+              <option value="0">0</option>
+              <option value="1">1</option>
+              <option value="2-5">2-5</option>
+              <option value="gt5">大于 5</option>
+            </select>
+            <select value={walletAgeFilter} onChange={(event) => setWalletAgeFilter(event.target.value)}>
+              <option value="all">钱包年龄：全部</option>
+              <option value="lt1">小于 1 天</option>
+              <option value="lt7">小于 7 天</option>
+              <option value="lt30">小于 30 天</option>
+              <option value="custom">自定义</option>
+            </select>
+            {walletAgeFilter === "custom" ? <>
+              <input className="smallInput" value={ageMin} onChange={(event) => setAgeMin(event.target.value)} placeholder="年龄最小" />
+              <input className="smallInput" value={ageMax} onChange={(event) => setAgeMax(event.target.value)} placeholder="年龄最大" />
+            </> : null}
+            <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+              <option value="all">状态：全部</option>
+              <option value="completed">completed</option>
+              <option value="retrying">retrying</option>
+              <option value="rate_limited">rate_limited</option>
+              <option value="coverage_limited">coverage_limited</option>
+              <option value="data_insufficient">data_insufficient</option>
+              <option value="analysis_error">analysis_error</option>
+              <option value="pending">pending</option>
             </select>
           </section>
 
@@ -555,15 +782,17 @@ export function AnalyzerClient() {
                   <th>详情</th>
                   <th>钱包</th>
                   <th>链接</th>
-                  <th>分析状态</th>
-                  <th>首次买入</th>
-                  <th>累计 SOL</th>
-                  <th>非基础币种数</th>
-                  <th>当前持仓</th>
+                  <th><button className="thButton" onClick={() => cycleSort("analysisStatus", "asc")}>分析状态{sortArrow("analysisStatus")}</button></th>
+                  <th><button className="thButton" onClick={() => cycleSort("firstBuyAt", "asc")}>首次买入{sortArrow("firstBuyAt")}</button></th>
+                  <th><button className="thButton" onClick={() => cycleSort("totalBuyAmountSol", "desc")}>累计 SOL{sortArrow("totalBuyAmountSol")}</button></th>
+                  <th><button className="thButton" onClick={() => cycleSort("historicalSwappedNonBaseTokenCount", "asc")}>历史参与币种数{sortArrow("historicalSwappedNonBaseTokenCount")}</button></th>
+                  <th><button className="thButton" onClick={() => cycleSort("everHeldNonBaseTokenCount", "asc")}>累计曾持有币种数{sortArrow("everHeldNonBaseTokenCount")}</button></th>
+                  <th><button className="thButton" onClick={() => cycleSort("currentHeldNonBaseTokenCount", "asc")}>当前持有币种数{sortArrow("currentHeldNonBaseTokenCount")}</button></th>
+                  <th>当前持有</th>
                   <th>是否卖光</th>
                   <th>扫描笔数</th>
                   <th>扫描页数</th>
-                  <th>钱包年龄</th>
+                  <th><button className="thButton" onClick={() => cycleSort("walletAgeDays", "asc")}>钱包年龄{sortArrow("walletAgeDays")}</button></th>
                   <th>原因</th>
                 </tr>
               </thead>
@@ -587,7 +816,9 @@ export function AnalyzerClient() {
                       <td><span className={`pill ${statusClass(wallet)}`}>{statusLabel(wallet)}</span></td>
                       <td>{fmtDate(wallet.firstBuyAt)}</td>
                       <td>{fmtNumber(wallet.totalBuyAmountSol)}</td>
-                      <td>{wallet.uniqueNonBaseTokenCount}</td>
+                      <td>{wallet.historicalSwappedNonBaseTokenCount}</td>
+                      <td>{wallet.everHeldNonBaseTokenCount}</td>
+                      <td>{wallet.currentHeldNonBaseTokenCount}</td>
                       <td>{yesNo(wallet.currentlyHolding)}</td>
                       <td>{yesNo(wallet.soldOut)}</td>
                       <td>{wallet.scanTransactionCount}</td>
@@ -597,12 +828,12 @@ export function AnalyzerClient() {
                     </tr>
                     {expandedWallet === wallet.wallet ? (
                       <tr>
-                        <td colSpan={13}><WalletDetails wallet={wallet} /></td>
+                        <td colSpan={15}><WalletDetails wallet={wallet} /></td>
                       </tr>
                     ) : null}
                   </Fragment>
                 ))}
-                {rows.length === 0 ? <tr><td colSpan={13} className="emptyCell">没有符合当前筛选的钱包</td></tr> : null}
+                {rows.length === 0 ? <tr><td colSpan={15} className="emptyCell">没有符合当前筛选的钱包</td></tr> : null}
               </tbody>
             </table>
           </section>

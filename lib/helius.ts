@@ -5,7 +5,14 @@ import {
   SOL_MINT
 } from "./constants";
 import { ApiError, isApiError, safeSnippet } from "./errors";
-import type { AnalysisStatus, HistoryRange, WalletDebugEvent } from "./types";
+import type {
+  AnalysisStatus,
+  CurrentHeldToken,
+  EverHeldToken,
+  HistoryRange,
+  TokenParticipation,
+  WalletDebugEvent
+} from "./types";
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -22,6 +29,8 @@ export type SwapScanResult = {
   heliusStatusCodes: number[];
   heliusRetryCount: number;
   retryAfterMs?: number;
+  historicalSwappedTokens: TokenParticipation[];
+  everHeldTokens: EverHeldToken[];
   debugEvents: WalletDebugEvent[];
 };
 
@@ -263,6 +272,69 @@ function extractSwapNonBaseMints(tx: UnknownRecord, wallet: string) {
   return mints;
 }
 
+function transferAmount(transfer: UnknownRecord) {
+  return asNumber(transfer.tokenAmount) ?? asNumber(asRecord(transfer.tokenAmount).uiAmount) ?? 0;
+}
+
+function isExcludedPassiveReceive(transfer: UnknownRecord, isSwap: boolean) {
+  if (isSwap) return false;
+  const amount = transferAmount(transfer);
+  const source = asString(transfer.source)?.toUpperCase();
+  const type = asString(transfer.type)?.toUpperCase();
+  return amount <= 0 || source === "AIRDROP" || type === "AIRDROP";
+}
+
+function noteSwapParticipation(
+  map: Map<string, TokenParticipation>,
+  mint: string,
+  tokenMint: string,
+  timestamp: string | undefined,
+  direction: "buy" | "sell" | "touch"
+) {
+  const existing =
+    map.get(mint) ??
+    ({
+      mint,
+      isCurrentToken: mint === tokenMint,
+      buyCount: 0,
+      sellCount: 0
+    } satisfies TokenParticipation);
+
+  if (!existing.firstSeenAt || (timestamp && new Date(timestamp) < new Date(existing.firstSeenAt))) {
+    existing.firstSeenAt = timestamp;
+  }
+  if (!existing.lastSeenAt || (timestamp && new Date(timestamp) > new Date(existing.lastSeenAt))) {
+    existing.lastSeenAt = timestamp;
+  }
+  if (direction === "buy") existing.buyCount += 1;
+  if (direction === "sell") existing.sellCount += 1;
+  map.set(mint, existing);
+}
+
+function noteEverHeld(
+  map: Map<string, EverHeldToken>,
+  mint: string,
+  timestamp: string | undefined,
+  acquiredBy: EverHeldToken["acquiredBy"],
+  excludedAsDustOrAirdrop: boolean
+) {
+  const existing =
+    map.get(mint) ??
+    ({
+      mint,
+      currentlyHeld: null,
+      acquiredBy,
+      excludedAsDustOrAirdrop
+    } satisfies EverHeldToken);
+
+  if (!existing.firstHeldAt || (timestamp && new Date(timestamp) < new Date(existing.firstHeldAt))) {
+    existing.firstHeldAt = timestamp;
+  }
+  if (existing.acquiredBy !== "swap" && acquiredBy === "swap") existing.acquiredBy = "swap";
+  existing.excludedAsDustOrAirdrop = existing.excludedAsDustOrAirdrop && excludedAsDustOrAirdrop;
+  map.set(mint, existing);
+}
+
 function getSwapLimit(historyRange: HistoryRange) {
   if (historyRange === "recent20") return 20;
   if (historyRange === "recent100") return 100;
@@ -285,6 +357,8 @@ export async function scanWalletSwapHistory(
   }
 
   const nonBaseTokenMints = new Set<string>();
+  const participationMap = new Map<string, TokenParticipation>();
+  const everHeldMap = new Map<string, EverHeldToken>();
   const debugEvents: WalletDebugEvent[] = [];
   const heliusStatusCodes: number[] = [];
   const startedAt = Date.now();
@@ -314,7 +388,6 @@ export async function scanWalletSwapHistory(
 
       const url = new URL(`https://api.helius.xyz/v0/addresses/${wallet}/transactions`);
       url.searchParams.set("api-key", apiKey);
-      url.searchParams.set("type", "SWAP");
       const remainingTransactions = swapLimit ? Math.max(1, swapLimit - transactionCount) : HELIUS_PAGE_LIMIT;
       url.searchParams.set("limit", String(Math.min(HELIUS_PAGE_LIMIT, remainingTransactions)));
       if (before) url.searchParams.set("before", before);
@@ -345,12 +418,34 @@ export async function scanWalletSwapHistory(
           firstActivityAt = seenAt;
         }
 
-        if (!isSwapTransaction(tx)) continue;
+        const isSwap = isSwapTransaction(tx);
+        for (const transfer of asArray(tx.tokenTransfers)) {
+          const mint = asString(transfer.mint);
+          if (!mint || IGNORED_MINTS.has(mint) || isLikelyNftTransfer(transfer)) continue;
+          const toWallet = asString(transfer.toUserAccount) === wallet;
+          if (toWallet && transferAmount(transfer) > 0) {
+            noteEverHeld(everHeldMap, mint, seenAt, isSwap ? "swap" : "transfer", isExcludedPassiveReceive(transfer, isSwap));
+          }
+        }
+
+        if (!isSwap) continue;
         transactionCount += 1;
 
         const txMints = extractSwapNonBaseMints(tx, wallet);
         if (txMints.has(tokenMint)) currentTokenSeen = true;
         for (const mint of txMints) nonBaseTokenMints.add(mint);
+        for (const transfer of asArray(tx.tokenTransfers)) {
+          const mint = asString(transfer.mint);
+          if (!mint || IGNORED_MINTS.has(mint) || isLikelyNftTransfer(transfer)) continue;
+          const fromWallet = asString(transfer.fromUserAccount) === wallet;
+          const toWallet = asString(transfer.toUserAccount) === wallet;
+          if (toWallet) noteSwapParticipation(participationMap, mint, tokenMint, seenAt, "buy");
+          if (fromWallet) noteSwapParticipation(participationMap, mint, tokenMint, seenAt, "sell");
+        }
+        for (const mint of txMints) {
+          if (!participationMap.has(mint)) noteSwapParticipation(participationMap, mint, tokenMint, seenAt, "touch");
+          noteEverHeld(everHeldMap, mint, seenAt, "swap", false);
+        }
 
         if (debugEvents.length < 80) {
           debugEvents.push({
@@ -401,6 +496,8 @@ export async function scanWalletSwapHistory(
       heliusStatusCodes,
       heliusRetryCount: retryCount,
       retryAfterMs: retryAfter,
+      historicalSwappedTokens: [...participationMap.values()].sort((a, b) => a.mint.localeCompare(b.mint)),
+      everHeldTokens: [...everHeldMap.values()].sort((a, b) => a.mint.localeCompare(b.mint)),
       debugEvents
     };
   }
@@ -442,6 +539,8 @@ export async function scanWalletSwapHistory(
     heliusStatusCodes,
     heliusRetryCount: retryCount,
     retryAfterMs: undefined,
+    historicalSwappedTokens: [...participationMap.values()].sort((a, b) => a.mint.localeCompare(b.mint)),
+    everHeldTokens: [...everHeldMap.values()].sort((a, b) => a.mint.localeCompare(b.mint)),
     debugEvents
   };
 }
@@ -519,6 +618,62 @@ export async function walletStillHoldsMint(wallet: string, mint: string): Promis
     });
   } catch {
     return null;
+  }
+}
+
+export async function walletCurrentHeldNonBaseTokens(wallet: string, tokenMint: string): Promise<CurrentHeldToken[]> {
+  const apiKey = process.env.HELIUS_API_KEY;
+  if (!apiKey) {
+    throw new ApiError("Missing environment variable", {
+      source: "server",
+      status: 500,
+      details: "Missing HELIUS_API_KEY"
+    });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4_000);
+    const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${apiKey}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "all-holdings",
+        method: "getTokenAccountsByOwner",
+        params: [
+          wallet,
+          { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
+          { encoding: "jsonParsed", commitment: "confirmed" }
+        ]
+      }),
+      cache: "no-store",
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    const raw = await response.text();
+    if (!response.ok) return [];
+    const payload = parseHeliusJson(raw, response.status);
+    const byMint = new Map<string, CurrentHeldToken>();
+
+    for (const account of asArray(asRecord(asRecord(payload).result).value)) {
+      const info = asRecord(asRecord(asRecord(account.account).data).parsed).info;
+      const mint = asString(asRecord(info).mint);
+      if (!mint || IGNORED_MINTS.has(mint)) continue;
+      const tokenAmount = asRecord(asRecord(info).tokenAmount);
+      const rawAmount = asString(tokenAmount.amount) ?? "0";
+      if (BigInt(rawAmount) <= 0n) continue;
+      byMint.set(mint, {
+        mint,
+        amount: asString(tokenAmount.uiAmountString) ?? rawAmount,
+        isCurrentToken: mint === tokenMint,
+        isBaseAsset: IGNORED_MINTS.has(mint)
+      });
+    }
+
+    return [...byMint.values()].sort((a, b) => a.mint.localeCompare(b.mint));
+  } catch {
+    return [];
   }
 }
 

@@ -233,6 +233,7 @@ select:focus {
 
 .controls {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 18px;
   margin-top: 14px;
@@ -253,7 +254,11 @@ select:focus {
 
 .controls select {
   width: 220px;
-  margin-left: auto;
+}
+
+.smallInput {
+  width: 120px;
+  min-height: 36px;
 }
 
 .debugPanel {
@@ -313,6 +318,16 @@ select:focus {
   word-break: break-all;
 }
 
+.tokenRow {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) repeat(5, minmax(110px, auto));
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  font-size: 12px;
+}
+
 .eventRow {
   display: grid;
   grid-template-columns: 120px 170px 90px 120px 130px minmax(220px, 1fr);
@@ -333,7 +348,7 @@ select:focus {
 
 table {
   width: 100%;
-  min-width: 1420px;
+  min-width: 1680px;
   border-collapse: collapse;
 }
 
@@ -353,6 +368,18 @@ th {
   background: #f9fafb;
   color: var(--muted);
   font-weight: 700;
+}
+
+.thButton {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 0;
+  text-align: left;
 }
 
 .walletCell,
@@ -405,6 +432,11 @@ a {
 }
 
 .analysis_error {
+  background: #fff0ed;
+  color: var(--danger);
+}
+
+.rate_limited {
   background: #fff0ed;
   color: var(--danger);
 }

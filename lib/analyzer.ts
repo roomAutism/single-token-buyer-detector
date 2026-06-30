@@ -1,6 +1,11 @@
 import { readWalletCache, writeWalletCache } from "./cache";
 import { fetchTokenBuyers } from "./birdeye";
-import { scanWalletSwapHistory, walletStillHoldsMint, type ScanWalletOptions } from "./helius";
+import {
+  scanWalletSwapHistory,
+  walletCurrentHeldNonBaseTokens,
+  walletStillHoldsMint,
+  type ScanWalletOptions
+} from "./helius";
 import type { AnalyzeResponse, BuyerLimit, HistoryRange, TokenBuyer, WalletAnalysis } from "./types";
 
 function walletAgeDays(firstActivityAt?: string) {
@@ -27,6 +32,12 @@ function pendingWallet(buyer: TokenBuyer): WalletAnalysis {
     distinctBoughtMintCount: 0,
     nonBaseTokenMints: [],
     uniqueNonBaseTokenCount: 0,
+    historicalSwappedNonBaseTokenCount: 0,
+    everHeldNonBaseTokenCount: 0,
+    currentHeldNonBaseTokenCount: 0,
+    historicalSwappedTokens: [],
+    everHeldTokens: [],
+    currentHeldTokens: [],
     stillHolding: null,
     currentlyHolding: null,
     soldOut: null,
@@ -53,8 +64,26 @@ export async function analyzeWallet(
   const strictSingleToken =
     scan.status === "completed" && nonBaseTokenMints.length === 1 && nonBaseTokenMints[0] === tokenMint;
   const isMulti = scan.status === "completed" && nonBaseTokenMints.some((mint) => mint !== tokenMint);
-  const currentlyHolding = await walletStillHoldsMint(buyer.wallet, tokenMint);
+  const [currentlyHolding, currentHeldTokens] = await Promise.all([
+    walletStillHoldsMint(buyer.wallet, tokenMint),
+    walletCurrentHeldNonBaseTokens(buyer.wallet, tokenMint)
+  ]);
   const soldOut = scan.currentTokenSeen && currentlyHolding !== null ? !currentlyHolding : null;
+  const everHeldTokens = scan.everHeldTokens.map((token) => ({
+    ...token,
+    currentlyHeld: currentHeldTokens.some((held) => held.mint === token.mint)
+  }));
+  for (const held of currentHeldTokens) {
+    if (!everHeldTokens.some((token) => token.mint === held.mint)) {
+      everHeldTokens.push({
+        mint: held.mint,
+        currentlyHeld: true,
+        acquiredBy: "unknown",
+        excludedAsDustOrAirdrop: false
+      });
+    }
+  }
+  const countedEverHeldTokens = everHeldTokens.filter((token) => !token.excludedAsDustOrAirdrop);
 
   const result: WalletAnalysis = {
     ...buyer,
@@ -66,6 +95,12 @@ export async function analyzeWallet(
     distinctBoughtMintCount: nonBaseTokenMints.length,
     nonBaseTokenMints,
     uniqueNonBaseTokenCount: nonBaseTokenMints.length,
+    historicalSwappedNonBaseTokenCount: nonBaseTokenMints.length,
+    everHeldNonBaseTokenCount: countedEverHeldTokens.length,
+    currentHeldNonBaseTokenCount: currentHeldTokens.length,
+    historicalSwappedTokens: scan.historicalSwappedTokens,
+    everHeldTokens: everHeldTokens.sort((a, b) => a.mint.localeCompare(b.mint)),
+    currentHeldTokens,
     stillHolding: currentlyHolding,
     currentlyHolding,
     soldOut,

@@ -4,10 +4,35 @@ export type AnalysisStatus =
   | "pending"
   | "analyzing"
   | "retrying"
+  | "rate_limited"
   | "completed"
   | "data_insufficient"
   | "analysis_error"
   | "coverage_limited";
+
+export type TokenParticipation = {
+  mint: string;
+  isCurrentToken: boolean;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+  buyCount: number;
+  sellCount: number;
+};
+
+export type EverHeldToken = {
+  mint: string;
+  firstHeldAt?: string;
+  currentlyHeld: boolean | null;
+  acquiredBy: "swap" | "transfer" | "unknown";
+  excludedAsDustOrAirdrop: boolean;
+};
+
+export type CurrentHeldToken = {
+  mint: string;
+  amount: string;
+  isCurrentToken: boolean;
+  isBaseAsset: boolean;
+};
 
 export type TokenBuyer = {
   wallet: string;
@@ -25,6 +50,12 @@ export type WalletAnalysis = TokenBuyer & {
   distinctBoughtMintCount: number;
   nonBaseTokenMints: string[];
   uniqueNonBaseTokenCount: number;
+  historicalSwappedNonBaseTokenCount: number;
+  everHeldNonBaseTokenCount: number;
+  currentHeldNonBaseTokenCount: number;
+  historicalSwappedTokens: TokenParticipation[];
+  everHeldTokens: EverHeldToken[];
+  currentHeldTokens: CurrentHeldToken[];
   stillHolding: boolean | null;
   currentlyHolding: boolean | null;
   soldOut: boolean | null;
