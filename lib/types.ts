@@ -3,6 +3,7 @@ export type HistoryRange = "recent20" | "recent100" | "full";
 export type AnalysisStatus =
   | "pending"
   | "analyzing"
+  | "retrying"
   | "completed"
   | "data_insufficient"
   | "analysis_error"
@@ -35,6 +36,7 @@ export type WalletAnalysis = TokenBuyer & {
   scanEndedAt?: string;
   heliusStatusCodes: number[];
   heliusRetryCount: number;
+  retryAfterMs?: number;
   debugEvents: WalletDebugEvent[];
   reason?: string;
 };

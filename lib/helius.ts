@@ -21,6 +21,7 @@ export type SwapScanResult = {
   reason?: string;
   heliusStatusCodes: number[];
   heliusRetryCount: number;
+  retryAfterMs?: number;
   debugEvents: WalletDebugEvent[];
 };
 
@@ -37,6 +38,15 @@ type HeliusPageResult = {
 };
 
 let heliusRequestTimestamps: number[] = [];
+let heliusSlowUntil = 0;
+let heliusLast429At = 0;
+
+function currentHeliusRateLimit() {
+  const now = Date.now();
+  if (now < heliusSlowUntil) return 1;
+  if (heliusLast429At && now - heliusLast429At < 20_000) return 2;
+  return 5;
+}
 
 function asRecord(value: unknown): UnknownRecord {
   return value && typeof value === "object" ? (value as UnknownRecord) : {};
@@ -86,10 +96,22 @@ async function wait(ms: number) {
 async function throttleHeliusRequest() {
   const now = Date.now();
   heliusRequestTimestamps = heliusRequestTimestamps.filter((timestamp) => now - timestamp < 1000);
-  if (heliusRequestTimestamps.length >= 5) {
+  const limit = currentHeliusRateLimit();
+  if (heliusRequestTimestamps.length >= limit) {
     await wait(1000 - (now - heliusRequestTimestamps[0]) + 25);
   }
   heliusRequestTimestamps.push(Date.now());
+}
+
+function retryAfterMs(response: Response) {
+  const value = response.headers.get("retry-after");
+  if (!value) return undefined;
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+
+  const dateMs = new Date(value).getTime();
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : undefined;
 }
 
 async function fetchHeliusPage(url: URL, wallet: string): Promise<HeliusPageResult> {
@@ -114,20 +136,27 @@ async function fetchHeliusPage(url: URL, wallet: string): Promise<HeliusPageResu
 
       lastStatus = response.status;
       if (!response.ok) {
+        const retryMs = retryAfterMs(response);
         console.error("[upstream-response]", {
           source: "helius",
           status: response.status,
           wallet: shortWallet(wallet),
           snippet: safeSnippet(raw),
           durationMs,
-          retries
+          retries,
+          retryAfterMs: retryMs
         });
+        if (response.status === 429) {
+          heliusLast429At = Date.now();
+          heliusSlowUntil = Date.now() + Math.max(retryMs ?? 10_000, 10_000);
+        }
         lastError = new ApiError(`Helius upstream ${response.status}`, {
           source: "helius",
           status: response.status,
-          details: safeSnippet(raw) || `HTTP ${response.status}`
+          details: safeSnippet(raw) || `HTTP ${response.status}`,
+          retryAfterMs: retryMs
         });
-        if (isRetryableStatus(response.status) && attempt < 3) {
+        if (response.status !== 429 && isRetryableStatus(response.status) && attempt < 3) {
           retries += 1;
           await wait(700 * 2 ** attempt + Math.floor(Math.random() * 200));
           continue;
@@ -271,6 +300,7 @@ export async function scanWalletSwapHistory(
   let transactionCount = 0;
   let pageCount = 0;
   let retryCount = 0;
+  let retryAfter: number | undefined;
   let reachedEnd = false;
   let reachedSafetyLimit = false;
   let currentTokenSeen = false;
@@ -344,6 +374,8 @@ export async function scanWalletSwapHistory(
   } catch (error) {
     const statusCode = typeof error === "object" && error !== null && "statusCode" in error ? Number(error.statusCode) : 0;
     const retries = typeof error === "object" && error !== null && "retries" in error ? Number(error.retries) : 0;
+    retryAfter =
+      error instanceof ApiError && typeof error.retryAfterMs === "number" ? error.retryAfterMs : undefined;
     if (statusCode) heliusStatusCodes.push(statusCode);
     retryCount += Number.isFinite(retries) ? retries : 0;
 
@@ -368,6 +400,7 @@ export async function scanWalletSwapHistory(
       reason: error instanceof Error ? error.message : "helius_request_error",
       heliusStatusCodes,
       heliusRetryCount: retryCount,
+      retryAfterMs: retryAfter,
       debugEvents
     };
   }
@@ -408,6 +441,7 @@ export async function scanWalletSwapHistory(
     reason,
     heliusStatusCodes,
     heliusRetryCount: retryCount,
+    retryAfterMs: undefined,
     debugEvents
   };
 }

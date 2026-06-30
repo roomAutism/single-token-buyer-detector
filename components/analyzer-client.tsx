@@ -34,6 +34,7 @@ function yesNo(value: boolean | null) {
 function statusLabel(wallet: WalletAnalysis) {
   if (wallet.analysisStatus === "pending") return "等待中";
   if (wallet.analysisStatus === "analyzing") return "分析中";
+  if (wallet.analysisStatus === "retrying") return "限流重试";
   if (wallet.analysisStatus === "completed") return wallet.strictSingleToken ? "严格单币" : "多币/非单币";
   if (wallet.analysisStatus === "data_insufficient") return "数据不足";
   if (wallet.analysisStatus === "analysis_error") return "分析失败";
@@ -99,7 +100,7 @@ function failedWallet(base: WalletAnalysis, message: string): WalletAnalysis {
   };
 }
 
-function markStatus(base: WalletAnalysis, status: "pending" | "analyzing"): WalletAnalysis {
+function markStatus(base: WalletAnalysis, status: "pending" | "analyzing" | "retrying"): WalletAnalysis {
   return {
     ...base,
     analysisStatus: status,
@@ -173,8 +174,12 @@ export function AnalyzerClient() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [stopped, setStopped] = useState(false);
+  const [retryingCount, setRetryingCount] = useState(0);
   const stopRef = useRef(false);
   const startTimesRef = useRef<number[]>([]);
+  const retryQueueRef = useRef<WalletAnalysis[]>([]);
+  const retryAttemptsRef = useRef<Map<string, number>>(new Map());
+  const retryRunningRef = useRef(false);
 
   function updateWallet(wallet: WalletAnalysis) {
     setData((current) => {
@@ -182,6 +187,10 @@ export function AnalyzerClient() {
       const wallets = current.wallets.map((row) => (row.wallet === wallet.wallet ? wallet : row));
       return { ...current, wallets, summary: summarizeRows(wallets) };
     });
+  }
+
+  function isHelius429(wallet: WalletAnalysis) {
+    return wallet.heliusStatusCodes.includes(429) || wallet.reason?.toLowerCase().includes("429");
   }
 
   async function throttleWalletRequest() {
@@ -228,6 +237,68 @@ export function AnalyzerClient() {
     return payload.wallet;
   }
 
+  function retryDelay(wallet: WalletAnalysis, attempt: number) {
+    if (wallet.retryAfterMs && wallet.retryAfterMs > 0) return wallet.retryAfterMs;
+    return [2000, 5000, 10000][Math.max(0, attempt - 1)] ?? 10000;
+  }
+
+  function enqueueRateLimitedWallet(wallet: WalletAnalysis, resetAttempts = false) {
+    if (resetAttempts) retryAttemptsRef.current.set(wallet.wallet, 0);
+    const attempts = retryAttemptsRef.current.get(wallet.wallet) ?? 0;
+    if (attempts >= 3) {
+      updateWallet(failedWallet({ ...wallet, heliusStatusCodes: [...new Set([...wallet.heliusStatusCodes, 429])] }, "Helius rate limited after 3 retries"));
+      return;
+    }
+
+    if (!retryQueueRef.current.some((item) => item.wallet === wallet.wallet)) {
+      retryQueueRef.current.push(wallet);
+    }
+    setRetryingCount(retryQueueRef.current.length);
+    updateWallet({ ...markStatus(wallet, "retrying"), reason: `Helius rate limited, retry ${attempts + 1}/3` });
+    void processRetryQueue();
+  }
+
+  async function processRetryQueue() {
+    if (retryRunningRef.current) return;
+    retryRunningRef.current = true;
+
+    while (!stopRef.current && retryQueueRef.current.length > 0) {
+      const base = retryQueueRef.current.shift();
+      setRetryingCount(retryQueueRef.current.length + (base ? 1 : 0));
+      if (!base) continue;
+
+      const nextAttempt = (retryAttemptsRef.current.get(base.wallet) ?? 0) + 1;
+      retryAttemptsRef.current.set(base.wallet, nextAttempt);
+      updateWallet({ ...markStatus(base, "retrying"), reason: `Helius rate limited, retry ${nextAttempt}/3` });
+      await new Promise((resolve) => setTimeout(resolve, retryDelay(base, nextAttempt)));
+
+      try {
+        const result = await analyzeOneWallet(base);
+        if (isHelius429(result)) {
+          if (nextAttempt >= 3) {
+            updateWallet(failedWallet(result, "Helius rate limited after 3 retries"));
+          } else {
+            enqueueRateLimitedWallet(result);
+          }
+        } else {
+          retryAttemptsRef.current.delete(base.wallet);
+          updateWallet(result);
+        }
+      } catch (err) {
+        const failed = failedWallet(base, err instanceof Error ? err.message : "wallet retry failed");
+        if (isHelius429(failed) && nextAttempt < 3) {
+          enqueueRateLimitedWallet(failed);
+        } else {
+          updateWallet(nextAttempt >= 3 ? failedWallet(base, "Helius rate limited after 3 retries") : failed);
+        }
+      }
+      setRetryingCount(retryQueueRef.current.length);
+    }
+
+    retryRunningRef.current = false;
+    setRetryingCount(retryQueueRef.current.length);
+  }
+
   async function runWalletQueue(wallets: WalletAnalysis[]) {
     let nextIndex = 0;
 
@@ -238,7 +309,12 @@ export function AnalyzerClient() {
         const base = wallets[currentIndex];
         updateWallet(markStatus(base, "analyzing"));
         try {
-          updateWallet(await analyzeOneWallet(base));
+          const result = await analyzeOneWallet(base);
+          if (isHelius429(result)) {
+            enqueueRateLimitedWallet(result, true);
+          } else {
+            updateWallet(result);
+          }
         } catch (err) {
           updateWallet(failedWallet(base, err instanceof Error ? err.message : "wallet analysis failed"));
         }
@@ -294,7 +370,8 @@ export function AnalyzerClient() {
 
     setDebugResult(markStatus(base, "analyzing"));
     try {
-      setDebugResult(await analyzeOneWallet(base));
+      const result = await analyzeOneWallet(base);
+      setDebugResult(isHelius429(result) ? { ...markStatus(result, "retrying"), reason: "Helius rate limited" } : result);
     } catch (err) {
       setDebugResult(failedWallet(base, err instanceof Error ? err.message : "debug wallet analysis failed"));
     }
@@ -306,6 +383,10 @@ export function AnalyzerClient() {
     setStopped(false);
     stopRef.current = false;
     startTimesRef.current = [];
+    retryQueueRef.current = [];
+    retryAttemptsRef.current = new Map();
+    retryRunningRef.current = false;
+    setRetryingCount(0);
     setData(null);
     setDebugResult(null);
     setDebugBuyer(null);
@@ -331,8 +412,21 @@ export function AnalyzerClient() {
 
   function stopAnalysis() {
     stopRef.current = true;
+    retryQueueRef.current = [];
+    setRetryingCount(0);
     setStopped(true);
     setLoading(false);
+  }
+
+  function retryAllRateLimitedWallets() {
+    if (!data) return;
+    setStopped(false);
+    stopRef.current = false;
+    for (const wallet of data.wallets) {
+      if (isHelius429(wallet) || wallet.reason === "Helius rate limited after 3 retries") {
+        enqueueRateLimitedWallet(wallet, true);
+      }
+    }
   }
 
   const summary = useMemo(() => summarizeRows(data?.wallets ?? []), [data]);
@@ -414,6 +508,7 @@ export function AnalyzerClient() {
       ) : null}
 
       {stopped ? <section className="panel hintPanel">分析已停止，已完成的钱包结果保留在表格中。</section> : null}
+      {retryingCount > 0 ? <section className="panel hintPanel">限流重试中 {retryingCount} 个钱包。</section> : null}
       {error ? <section className="errorPanel">{error}</section> : null}
 
       {data ? (
@@ -443,6 +538,9 @@ export function AnalyzerClient() {
           <section className="panel controls">
             <label><input type="checkbox" checked={onlySingle} onChange={(event) => setOnlySingle(event.target.checked)} /> 仅严格单币</label>
             <label><input type="checkbox" checked={onlyHolding} onChange={(event) => setOnlyHolding(event.target.checked)} /> 仅仍持仓</label>
+            <button className="secondaryButton" onClick={retryAllRateLimitedWallets} disabled={!data.wallets.some((wallet) => isHelius429(wallet))}>
+              重试所有限流失败钱包
+            </button>
             <select value={sortKey} onChange={(event) => setSortKey(event.target.value as SortKey)}>
               <option value="firstBuyAt">按首次买入时间</option>
               <option value="totalBuyAmountSol">按累计买入金额</option>

@@ -99,6 +99,7 @@ select:focus {
 }
 
 .primaryButton,
+.secondaryButton,
 .iconButton,
 .miniButton {
   display: inline-flex;
@@ -116,6 +117,21 @@ select:focus {
   color: #fff;
   padding: 0 16px;
   font-weight: 700;
+}
+
+.secondaryButton {
+  min-height: 36px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--text);
+  padding: 0 12px;
+  font-weight: 700;
+}
+
+.secondaryButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .primaryButton:hover {
@@ -406,6 +422,11 @@ a {
 .analyzing {
   background: #e7f7ee;
   color: var(--accent-dark);
+}
+
+.retrying {
+  background: #fff3dc;
+  color: var(--warning);
 }
 
 .emptyCell {

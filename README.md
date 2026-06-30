@@ -36,6 +36,14 @@ Vercel Serverless 有执行时长限制，所以工具分两阶段运行：
 
 前端负责调度钱包队列，默认最大并发 2，并实时显示 `pending`、`analyzing`、`completed`、`data_insufficient`、`coverage_limited`、`analysis_error`。
 
+Helius 429 限流会进入独立重试队列，不阻塞首轮分析：
+
+- 首轮钱包分析保持最大并发 2，已完成结果立即显示。
+- 只有 Helius 429 钱包会进入 `retrying` 状态。
+- 优先使用 `Retry-After`，否则按 2 秒、5 秒、10 秒退避。
+- 最多重试 3 次，最终失败显示 `Helius rate limited after 3 retries`。
+- 服务端 Helius 请求共享自适应节流器；出现 429 后短时间降速，稳定后恢复。
+
 ## 配置
 
 复制环境变量文件：

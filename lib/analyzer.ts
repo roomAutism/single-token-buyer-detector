@@ -77,6 +77,7 @@ export async function analyzeWallet(
     scanEndedAt: scan.scanEndedAt,
     heliusStatusCodes: scan.heliusStatusCodes,
     heliusRetryCount: scan.heliusRetryCount,
+    retryAfterMs: scan.retryAfterMs,
     debugEvents: scan.debugEvents,
     reason: scan.reason
   };

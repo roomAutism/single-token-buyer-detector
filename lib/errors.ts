@@ -4,13 +4,15 @@ export class ApiError extends Error {
   source: ErrorSource;
   status: number;
   details: string;
+  retryAfterMs?: number;
 
-  constructor(message: string, options: { source: ErrorSource; status?: number; details?: string }) {
+  constructor(message: string, options: { source: ErrorSource; status?: number; details?: string; retryAfterMs?: number }) {
     super(message);
     this.name = "ApiError";
     this.source = options.source;
     this.status = options.status ?? 500;
     this.details = options.details ?? message;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
