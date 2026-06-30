@@ -4,17 +4,32 @@ import {
   IGNORED_MINTS,
   SOL_MINT
 } from "./constants";
-import { withRetry } from "./rate-limit";
-import type { Confidence, HistoryRange } from "./types";
+import type { AnalysisStatus, HistoryRange, WalletDebugEvent } from "./types";
 
 type UnknownRecord = Record<string, unknown>;
 
-type SwapScanResult = {
-  boughtMints: Set<string>;
+export type SwapScanResult = {
+  nonBaseTokenMints: Set<string>;
+  currentTokenSeen: boolean;
   firstActivityAt?: string;
-  confidence: Confidence;
+  scanStartedAt?: string;
+  scanEndedAt?: string;
+  transactionCount: number;
+  pageCount: number;
+  status: AnalysisStatus;
   reason?: string;
+  heliusStatusCodes: number[];
+  heliusRetryCount: number;
+  debugEvents: WalletDebugEvent[];
 };
+
+type HeliusPageResult = {
+  txs: UnknownRecord[];
+  statusCode: number;
+  retries: number;
+};
+
+let heliusRequestTimestamps: number[] = [];
 
 function asRecord(value: unknown): UnknownRecord {
   return value && typeof value === "object" ? (value as UnknownRecord) : {};
@@ -32,8 +47,8 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function normalizeAccount(value: unknown) {
-  return asString(value) ?? "";
+function shortWallet(wallet: string) {
+  return `${wallet.slice(0, 6)}...${wallet.slice(-4)}`;
 }
 
 function txTime(tx: UnknownRecord) {
@@ -41,57 +56,104 @@ function txTime(tx: UnknownRecord) {
   return timestamp ? new Date(timestamp * 1000).toISOString() : undefined;
 }
 
+function isRetryableStatus(status: number) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+async function wait(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function throttleHeliusRequest() {
+  const now = Date.now();
+  heliusRequestTimestamps = heliusRequestTimestamps.filter((timestamp) => now - timestamp < 1000);
+  if (heliusRequestTimestamps.length >= 5) {
+    await wait(1000 - (now - heliusRequestTimestamps[0]) + 25);
+  }
+  heliusRequestTimestamps.push(Date.now());
+}
+
+async function fetchHeliusPage(url: URL): Promise<HeliusPageResult> {
+  let retries = 0;
+  let lastStatus = 0;
+  let lastError = "request_failed";
+
+  for (let attempt = 0; attempt <= 3; attempt += 1) {
+    try {
+      await throttleHeliusRequest();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 18_000);
+      const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+      clearTimeout(timeout);
+
+      lastStatus = response.status;
+      if (!response.ok) {
+        lastError = `helius_http_${response.status}`;
+        if (isRetryableStatus(response.status) && attempt < 3) {
+          retries += 1;
+          await wait(700 * 2 ** attempt + Math.floor(Math.random() * 200));
+          continue;
+        }
+        throw new Error(lastError);
+      }
+
+      const payload = await response.json();
+      if (!Array.isArray(payload)) {
+        throw new Error("helius_unexpected_response_shape");
+      }
+
+      return { txs: payload.map(asRecord), statusCode: response.status, retries };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : "helius_request_error";
+      if (attempt < 3) {
+        retries += 1;
+        await wait(700 * 2 ** attempt + Math.floor(Math.random() * 200));
+        continue;
+      }
+    }
+  }
+
+  throw Object.assign(new Error(lastError), { statusCode: lastStatus, retries });
+}
+
 function isLikelyNftTransfer(transfer: UnknownRecord) {
   const standard = asString(transfer.tokenStandard)?.toLowerCase();
   const amount = asNumber(transfer.tokenAmount);
-  return standard?.includes("nonfungible") || standard === "programmablenft" || amount === 1 && standard === "nft";
+  return standard?.includes("nonfungible") || standard === "programmablenft" || (amount === 1 && standard === "nft");
 }
 
-function walletSpentSwapInput(tx: UnknownRecord, wallet: string) {
-  const nativeSpent = asArray(tx.nativeTransfers).some((transfer) => {
-    return normalizeAccount(transfer.fromUserAccount) === wallet && (asNumber(transfer.amount) ?? 0) > 0;
-  });
-
-  const ignoredTokenSpent = asArray(tx.tokenTransfers).some((transfer) => {
-    const mint = asString(transfer.mint);
-    return (
-      normalizeAccount(transfer.fromUserAccount) === wallet &&
-      !!mint &&
-      IGNORED_MINTS.has(mint) &&
-      (asNumber(transfer.tokenAmount) ?? 0) > 0
-    );
-  });
-
+function isSwapTransaction(tx: UnknownRecord) {
+  const type = asString(tx.type)?.toUpperCase();
   const swapEvent = asRecord(asRecord(tx.events).swap);
-  const eventNativeInput = asRecord(swapEvent.nativeInput);
-  const eventTokenInputs = asArray(swapEvent.tokenInputs);
-  const eventSpent =
-    normalizeAccount(eventNativeInput.account) === wallet ||
-    eventTokenInputs.some((input) => {
-      const mint = asString(input.mint);
-      return normalizeAccount(input.userAccount) === wallet && !!mint && IGNORED_MINTS.has(mint);
-    });
-
-  return nativeSpent || ignoredTokenSpent || eventSpent;
+  return type === "SWAP" || Object.keys(swapEvent).length > 0;
 }
 
-function receivedBoughtMints(tx: UnknownRecord, wallet: string) {
+function extractSwapNonBaseMints(tx: UnknownRecord, wallet: string) {
   const mints = new Set<string>();
 
   for (const transfer of asArray(tx.tokenTransfers)) {
     const mint = asString(transfer.mint);
     if (!mint || IGNORED_MINTS.has(mint) || isLikelyNftTransfer(transfer)) continue;
-    if (normalizeAccount(transfer.toUserAccount) === wallet && (asNumber(transfer.tokenAmount) ?? 0) > 0) {
-      mints.add(mint);
-    }
+
+    const fromWallet = asString(transfer.fromUserAccount) === wallet;
+    const toWallet = asString(transfer.toUserAccount) === wallet;
+    if (fromWallet || toWallet) mints.add(mint);
   }
 
   const swapEvent = asRecord(asRecord(tx.events).swap);
-  for (const output of asArray(swapEvent.tokenOutputs)) {
-    const mint = asString(output.mint);
-    if (!mint || IGNORED_MINTS.has(mint)) continue;
-    if (normalizeAccount(output.userAccount) === wallet || normalizeAccount(output.owner) === wallet) {
-      mints.add(mint);
+  for (const collection of ["tokenInputs", "tokenOutputs"]) {
+    for (const item of asArray(swapEvent[collection])) {
+      const mint = asString(item.mint);
+      if (!mint || IGNORED_MINTS.has(mint)) continue;
+
+      const belongsToWallet =
+        asString(item.userAccount) === wallet ||
+        asString(item.owner) === wallet ||
+        asString(item.account) === wallet;
+
+      if (belongsToWallet || asArray(tx.tokenTransfers).length === 0) {
+        mints.add(mint);
+      }
     }
   }
 
@@ -104,23 +166,33 @@ function getRangeCutoff(historyRange: HistoryRange) {
   return undefined;
 }
 
-function getMaxSwapPages(historyRange: HistoryRange) {
-  if (historyRange === "500swaps") return 5;
-  if (historyRange === "full") return HELIUS_MAX_PAGES_FULL_HISTORY;
-  return HELIUS_MAX_PAGES_FULL_HISTORY;
+function getSwapLimit(historyRange: HistoryRange) {
+  if (historyRange === "20swaps") return 20;
+  if (historyRange === "500swaps") return 500;
+  return undefined;
 }
 
-export async function scanWalletSwapHistory(wallet: string, historyRange: HistoryRange): Promise<SwapScanResult> {
+export async function scanWalletSwapHistory(wallet: string, tokenMint: string, historyRange: HistoryRange): Promise<SwapScanResult> {
   const apiKey = process.env.HELIUS_API_KEY;
   if (!apiKey) throw new Error("Missing HELIUS_API_KEY");
 
-  const boughtMints = new Set<string>();
+  const nonBaseTokenMints = new Set<string>();
+  const debugEvents: WalletDebugEvent[] = [];
+  const heliusStatusCodes: number[] = [];
   const cutoffMs = getRangeCutoff(historyRange);
-  const maxPages = getMaxSwapPages(historyRange);
+  const swapLimit = getSwapLimit(historyRange);
+  const maxPages = historyRange === "full" ? HELIUS_MAX_PAGES_FULL_HISTORY : Math.ceil((swapLimit ?? 1000) / HELIUS_PAGE_LIMIT) || 1;
+
   let before: string | undefined;
   let firstActivityAt: string | undefined;
+  let scanStartedAt: string | undefined;
+  let scanEndedAt: string | undefined;
+  let transactionCount = 0;
+  let pageCount = 0;
+  let retryCount = 0;
   let reachedEnd = false;
   let reachedCutoff = false;
+  let currentTokenSeen = false;
 
   try {
     for (let page = 0; page < maxPages; page += 1) {
@@ -130,66 +202,131 @@ export async function scanWalletSwapHistory(wallet: string, historyRange: Histor
       url.searchParams.set("limit", String(HELIUS_PAGE_LIMIT));
       if (before) url.searchParams.set("before", before);
 
-      const txs = await withRetry(async () => {
-        const response = await fetch(url, { cache: "no-store" });
-        if (!response.ok) throw new Error(`Helius history request failed: ${response.status}`);
-        return (await response.json()) as UnknownRecord[];
+      const pageResult = await fetchHeliusPage(url);
+      pageCount += 1;
+      retryCount += pageResult.retries;
+      heliusStatusCodes.push(pageResult.statusCode);
+
+      console.log("[helius-scan-page]", {
+        wallet: shortWallet(wallet),
+        page: pageCount,
+        returned: pageResult.txs.length,
+        statusCode: pageResult.statusCode,
+        retries: pageResult.retries
       });
 
-      if (!Array.isArray(txs) || txs.length === 0) {
+      if (pageResult.txs.length === 0) {
         reachedEnd = true;
         break;
       }
 
-      for (const tx of txs) {
+      for (const tx of pageResult.txs) {
         const seenAt = txTime(tx);
-        if (seenAt) firstActivityAt = seenAt;
+        if (seenAt && !scanStartedAt) scanStartedAt = seenAt;
+        if (seenAt) {
+          scanEndedAt = seenAt;
+          firstActivityAt = seenAt;
+        }
 
         if (cutoffMs && seenAt && new Date(seenAt).getTime() < cutoffMs) {
           reachedCutoff = true;
           break;
         }
 
-        if (!walletSpentSwapInput(tx, wallet)) continue;
-        for (const mint of receivedBoughtMints(tx, wallet)) boughtMints.add(mint);
+        if (!isSwapTransaction(tx)) continue;
+        transactionCount += 1;
+
+        const txMints = extractSwapNonBaseMints(tx, wallet);
+        if (txMints.has(tokenMint)) currentTokenSeen = true;
+        for (const mint of txMints) nonBaseTokenMints.add(mint);
+
+        if (debugEvents.length < 80) {
+          debugEvents.push({
+            signature: asString(tx.signature) ?? "unknown",
+            type: asString(tx.type),
+            source: asString(tx.source),
+            timestamp: seenAt,
+            isSwap: true,
+            nonBaseMints: [...txMints].sort(),
+            involvesCurrentToken: txMints.has(tokenMint)
+          });
+        }
+
+        if (swapLimit && transactionCount >= swapLimit) break;
       }
 
-      const last = txs[txs.length - 1];
+      const last = pageResult.txs[pageResult.txs.length - 1];
       before = asString(last.signature);
-      if (!before || reachedCutoff) break;
+      if (!before || reachedCutoff || (swapLimit && transactionCount >= swapLimit)) break;
     }
   } catch (error) {
+    const statusCode = typeof error === "object" && error !== null && "statusCode" in error ? Number(error.statusCode) : 0;
+    const retries = typeof error === "object" && error !== null && "retries" in error ? Number(error.retries) : 0;
+    if (statusCode) heliusStatusCodes.push(statusCode);
+    retryCount += Number.isFinite(retries) ? retries : 0;
+
+    console.log("[helius-scan-final]", {
+      wallet: shortWallet(wallet),
+      pages: pageCount,
+      status: "analysis_error",
+      reason: error instanceof Error ? error.message : "helius_request_error",
+      nonBaseTokenCount: nonBaseTokenMints.size,
+      retries: retryCount
+    });
+
     return {
-      boughtMints,
+      nonBaseTokenMints,
+      currentTokenSeen,
       firstActivityAt,
-      confidence: "insufficient",
-      reason: error instanceof Error ? error.message : "Failed to scan wallet history"
+      scanStartedAt,
+      scanEndedAt,
+      transactionCount,
+      pageCount,
+      status: "analysis_error",
+      reason: error instanceof Error ? error.message : "helius_request_error",
+      heliusStatusCodes,
+      heliusRetryCount: retryCount,
+      debugEvents
     };
   }
 
-  if (historyRange === "full" && !reachedEnd) {
-    return {
-      boughtMints,
-      firstActivityAt,
-      confidence: "insufficient",
-      reason: "Full-history scan reached the configured page limit before wallet history ended"
-    };
+  let status: AnalysisStatus = "completed";
+  let reason: string | undefined;
+
+  if (transactionCount === 0) {
+    status = "data_insufficient";
+    reason = "no_transactions";
+  } else if (historyRange === "full" && !reachedEnd) {
+    status = "coverage_limited";
+    reason = "coverage_limit_reached";
+  } else if ((historyRange === "30d" || historyRange === "90d") && !reachedCutoff && !reachedEnd) {
+    status = "coverage_limited";
+    reason = "coverage_limit_reached";
   }
 
-  if ((historyRange === "30d" || historyRange === "90d") && !reachedCutoff && !reachedEnd) {
-    return {
-      boughtMints,
-      firstActivityAt,
-      confidence: "insufficient",
-      reason: "Date-range scan did not complete"
-    };
-  }
+  console.log("[helius-scan-final]", {
+    wallet: shortWallet(wallet),
+    pages: pageCount,
+    txs: transactionCount,
+    status,
+    reason,
+    nonBaseTokenCount: nonBaseTokenMints.size,
+    retries: retryCount
+  });
 
   return {
-    boughtMints,
+    nonBaseTokenMints,
+    currentTokenSeen,
     firstActivityAt,
-    confidence: historyRange === "full" ? "complete" : "partial",
-    reason: historyRange === "full" ? undefined : "Result only covers the selected scan range"
+    scanStartedAt,
+    scanEndedAt,
+    transactionCount,
+    pageCount,
+    status,
+    reason,
+    heliusStatusCodes,
+    heliusRetryCount: retryCount,
+    debugEvents
   };
 }
 
@@ -198,30 +335,29 @@ export async function walletStillHoldsMint(wallet: string, mint: string): Promis
   if (!apiKey) throw new Error("Missing HELIUS_API_KEY");
 
   try {
-    const response = await withRetry(async () => {
-      const result = await fetch(`https://mainnet.helius-rpc.com/?api-key=${apiKey}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "holdings",
-          method: "getTokenAccountsByOwner",
-          params: [
-            wallet,
-            { mint },
-            {
-              encoding: "jsonParsed",
-              commitment: "confirmed"
-            }
-          ]
-        }),
-        cache: "no-store"
-      });
-      if (!result.ok) throw new Error(`Helius RPC holdings request failed: ${result.status}`);
-      return result.json();
+    const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${apiKey}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "holdings",
+        method: "getTokenAccountsByOwner",
+        params: [
+          wallet,
+          { mint },
+          {
+            encoding: "jsonParsed",
+            commitment: "confirmed"
+          }
+        ]
+      }),
+      cache: "no-store"
     });
 
-    const accounts = asArray(asRecord(asRecord(response).result).value);
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const accounts = asArray(asRecord(asRecord(payload).result).value);
+
     return accounts.some((account) => {
       const info = asRecord(asRecord(asRecord(account.account).data).parsed).info;
       const amount = asRecord(asRecord(info).tokenAmount);

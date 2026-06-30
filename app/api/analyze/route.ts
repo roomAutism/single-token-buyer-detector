@@ -10,8 +10,16 @@ const requestSchema = z.object({
     .string()
     .trim()
     .regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/, "Invalid Solana token address"),
+  debugWallet: z
+    .string()
+    .trim()
+    .regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/, "Invalid Solana wallet address")
+    .optional()
+    .or(z.literal("")),
   buyerLimit: z.union([z.literal(100), z.literal(300), z.literal(500)]).default(100),
-  historyRange: z.union([z.literal("30d"), z.literal("90d"), z.literal("500swaps"), z.literal("full")]).default("full")
+  historyRange: z
+    .union([z.literal("20swaps"), z.literal("30d"), z.literal("90d"), z.literal("500swaps"), z.literal("full")])
+    .default("full")
 });
 
 export async function POST(request: Request) {
@@ -27,7 +35,8 @@ export async function POST(request: Request) {
     const result = await analyzeTokenBuyers(
       parsed.data.tokenMint,
       parsed.data.buyerLimit,
-      parsed.data.historyRange
+      parsed.data.historyRange,
+      parsed.data.debugWallet || undefined
     );
     return NextResponse.json(result);
   } catch (error) {

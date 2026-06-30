@@ -64,7 +64,7 @@ h1 {
 
 .inputPanel {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) 190px 210px 150px;
+  grid-template-columns: minmax(260px, 1fr) minmax(240px, 0.8fr) 190px 210px 150px;
   gap: 12px;
   align-items: flex-end;
   padding: 14px;
@@ -184,7 +184,7 @@ select:focus {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(6, minmax(130px, 1fr));
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
   gap: 12px;
   margin-top: 14px;
 }
@@ -234,6 +234,73 @@ select:focus {
   margin-left: auto;
 }
 
+.debugPanel {
+  margin-top: 14px;
+  padding: 14px;
+}
+
+.debugHeader {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.debugHeader div,
+.detailsGrid div {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 10px;
+}
+
+.debugHeader span,
+.detailsGrid span,
+.mintList > span,
+.eventList > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.detailsBox {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.detailsGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.mintList,
+.eventList {
+  display: grid;
+  gap: 8px;
+}
+
+.mintList code {
+  width: fit-content;
+  max-width: 100%;
+  white-space: normal;
+  word-break: break-all;
+}
+
+.eventRow {
+  display: grid;
+  grid-template-columns: 120px 170px 90px 120px 130px minmax(220px, 1fr);
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  font-size: 12px;
+}
+
 .tableWrap {
   overflow: auto;
   margin-top: 14px;
@@ -244,7 +311,7 @@ select:focus {
 
 table {
   width: 100%;
-  min-width: 1120px;
+  min-width: 1420px;
   border-collapse: collapse;
 }
 
@@ -310,6 +377,21 @@ a {
   color: var(--danger);
 }
 
+.data_insufficient {
+  background: #fff3dc;
+  color: var(--warning);
+}
+
+.analysis_error {
+  background: #fff0ed;
+  color: var(--danger);
+}
+
+.coverage_limited {
+  background: #eef4ff;
+  color: #175cd3;
+}
+
 .emptyCell {
   height: 120px;
   color: var(--muted);
@@ -318,11 +400,14 @@ a {
 
 @media (max-width: 980px) {
   .inputPanel,
-  .metrics {
+  .metrics,
+  .debugHeader,
+  .detailsGrid {
     grid-template-columns: 1fr 1fr;
   }
 
   .tokenField,
+  .debugField,
   .primaryButton {
     grid-column: 1 / -1;
   }
@@ -339,7 +424,9 @@ a {
   }
 
   .inputPanel,
-  .metrics {
+  .metrics,
+  .debugHeader,
+  .detailsGrid {
     grid-template-columns: 1fr;
   }
 
